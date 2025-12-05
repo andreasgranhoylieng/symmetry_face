@@ -202,6 +202,10 @@ def run_analysis(image):
     M_rot = cv2.getRotationMatrix2D(center_guess, best_angle, 1.0)
     final_rot = cv2.warpAffine(image, M_rot, (w, h), flags=cv2.INTER_LINEAR)
     
+    # Create image with symmetry line
+    final_rot_with_line = final_rot.copy()
+    cv2.line(final_rot_with_line, (int(axis_x), 0), (int(axis_x), h), (0, 255, 0), 2)
+    
     # 2. Create Symmetrical Face
     M_flip = np.float32([[-1, 0, 2*axis_x], [0, 1, 0]])
     final_flipped = cv2.warpAffine(final_rot, M_flip, (w, h), flags=cv2.INTER_LINEAR)
@@ -224,6 +228,7 @@ def run_analysis(image):
         "mask": mask,
         "landmarks_debug": landmarks_debug,
         "final_rot": final_rot,
+        "final_rot_with_line": final_rot_with_line,
         "final_flipped": final_flipped,
         "symmetrical_avg": symmetrical_avg,
         "diff_heatmap": diff_heatmap,
@@ -320,7 +325,7 @@ def main():
                 r_col1, r_col2, r_col3 = st.columns(3)
                 
                 with r_col1:
-                    st.image(results['final_rot'], caption="Aligned Original", width="stretch")
+                    st.image(results['final_rot_with_line'], caption="Aligned Original with Symmetry Axis", width="stretch")
                     
                 with r_col2:
                     st.image(results['symmetrical_avg'], caption="Symmetrized Face (Average)", width="stretch")
