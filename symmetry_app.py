@@ -155,15 +155,82 @@ def transform_and_compare(params, image_gray, mask, center_guess, debug_containe
     
     # Visualization callback
     if debug_container is not None:
-        # Create a visualization: Left half original, Right half flipped (composited)
-        # Or just an overlay
-        vis = cv2.addWeighted(img_rot, 0.5, img_flipped, 0.5, 0)
+        # Create a visualization: Just the rotated image with the axis line
+        vis = img_rot.copy()
         # Draw the axis
         cv2.line(vis, (int(axis_x), 0), (int(axis_x), h), (255, 0, 0), 2)
         debug_container.image(vis, caption=f"Optimizing... Score: {score:.2f}", clamp=True)
-        # time.sleep(0.05) # Slow down slightly to see animation
         
     return score
+
+@st.cache_data
+def run_analysis(image):
+    # This function will be cached so it doesn't re-run on every interaction
+    mask, center_guess, initial_guess_params, landmarks_debug = get_face_mask(image)
+    
+    if mask is None:
+        return None
+        
+    image_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+    h, w = image_gray.shape
+    
+    # Optimization function wrapper
+    # Note: We can't pass the viz_placeholder to a cached function easily if we want live updates.
+    # But since we are caching the RESULT, the live updates only happen on the FIRST run.
+    # To keep live updates working, we might need to separate the "calculation" from "caching" 
+    # or accept that cached runs won't show the progress bar.
+    # However, the user wants the animation to work without restarting.
+    # So we will cache the FINAL result.
+    
+    def loss_func(params):
+        # We won't visualize inside the cached function to avoid pickling issues with Streamlit containers
+        return transform_and_compare(params, image_gray, mask, center_guess, None)
+    
+    initial_guess = initial_guess_params
+    bounds = [
+        (initial_guess[0] - 10, initial_guess[0] + 10), 
+        (initial_guess[1] - 20, initial_guess[1] + 20)
+    ]
+    
+    res = minimize(loss_func, initial_guess, method='Powell', bounds=bounds, tol=1e-3)
+    best_angle, best_shift = res.x
+    
+    # Generate Final Result
+    axis_x = center_guess[0] + best_shift
+    
+    # 1. Rotate Original Color Image
+    M_rot = cv2.getRotationMatrix2D(center_guess, best_angle, 1.0)
+    final_rot = cv2.warpAffine(image, M_rot, (w, h), flags=cv2.INTER_LINEAR)
+    
+    # 2. Create Symmetrical Face
+    M_flip = np.float32([[-1, 0, 2*axis_x], [0, 1, 0]])
+    final_flipped = cv2.warpAffine(final_rot, M_flip, (w, h), flags=cv2.INTER_LINEAR)
+    
+    # Average Symmetry
+    symmetrical_avg = cv2.addWeighted(final_rot, 0.5, final_flipped, 0.5, 0)
+    
+    # Difference Map (Heatmap)
+    diff = cv2.absdiff(final_rot, final_flipped)
+    diff = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
+    diff_heatmap = cv2.applyColorMap(diff, cv2.COLORMAP_JET)
+    
+    # Mask the heatmap
+    mask_rot = cv2.warpAffine(mask, M_rot, (w, h), flags=cv2.INTER_NEAREST)
+    mask_flipped = cv2.warpAffine(mask_rot, M_flip, (w, h), flags=cv2.INTER_NEAREST)
+    intersection = cv2.bitwise_and(mask_rot, mask_flipped)
+    diff_heatmap = cv2.bitwise_and(diff_heatmap, diff_heatmap, mask=intersection)
+    
+    return {
+        "mask": mask,
+        "landmarks_debug": landmarks_debug,
+        "final_rot": final_rot,
+        "final_flipped": final_flipped,
+        "symmetrical_avg": symmetrical_avg,
+        "diff_heatmap": diff_heatmap,
+        "best_angle": best_angle,
+        "best_shift": best_shift,
+        "initial_guess": initial_guess
+    }
 
 def main():
     st.set_page_config(page_title="Face Symmetry Finder", layout="wide")
@@ -194,110 +261,91 @@ def main():
             scale = max_dim / max(h, w)
             image = cv2.resize(image, (int(w*scale), int(h*scale)))
             
-        st.image(image, caption="Original Image", use_container_width=True)
+        st.image(image, caption="Original Image", width="stretch")
         
-        if st.button("Analyze Symmetry"):
-            with st.spinner("Detecting face and segmenting..."):
-                mask, center_guess, initial_guess_params, landmarks_debug = get_face_mask(image)
-                
-            if mask is None:
-                st.error("No face detected! Please try another image.")
-                return
-                
-            st.success("Face detected! Starting optimization...")
+        # Use session state to store analysis results
+        if 'analysis_results' not in st.session_state:
+            st.session_state.analysis_results = None
+        if 'last_uploaded_file' not in st.session_state:
+            st.session_state.last_uploaded_file = None
             
-            col1, col2 = st.columns(2)
-            with col1:
-                # Draw landmarks on a copy of the image for visualization
-                img_debug = image.copy()
-                if landmarks_debug:
-                    cv2.circle(img_debug, landmarks_debug['left_iris'], 5, (0, 255, 0), -1)
-                    cv2.circle(img_debug, landmarks_debug['right_iris'], 5, (0, 255, 0), -1)
-                    cv2.circle(img_debug, landmarks_debug['nose_tip'], 5, (255, 0, 0), -1)
-                    # Draw line between eyes
-                    cv2.line(img_debug, landmarks_debug['left_iris'], landmarks_debug['right_iris'], (0, 255, 0), 2)
-                
-                st.image(img_debug, caption="Detected Landmarks (Eyes & Nose)", use_container_width=True)
-            
-            # Prepare for optimization
-            image_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
-            
-            # Placeholder for live visualization
-            with col2:
-                st.markdown("### Optimization Progress")
-                viz_placeholder = st.empty()
-            
-            # Optimization function wrapper to pass extra args
-            def loss_func(params):
-                return transform_and_compare(params, image_gray, mask, center_guess, viz_placeholder)
-            
-            # Initial guess: Use calculated params from landmarks
-            initial_guess = initial_guess_params
-            st.info(f"Initial Guess from Landmarks - Angle: {initial_guess[0]:.2f}°, Shift: {initial_guess[1]:.2f} px")
-            
-            # Bounds: Angle +/- 10 degrees, Shift +/- 20 pixels
-            # We trust the landmarks significantly more now.
-            # The optimization should only refine slightly.
-            bounds = [
-                (initial_guess[0] - 10, initial_guess[0] + 10), 
-                (initial_guess[1] - 20, initial_guess[1] + 20)
-            ]
-            
-            # Run optimization
-            # Powell is a good method for this kind of parameter search without gradients
-            res = minimize(loss_func, initial_guess, method='Powell', bounds=bounds, tol=1e-3)
-            
-            best_angle, best_shift = res.x
-            best_score = res.fun
-            
-            st.success(f"Optimization Complete! Best Angle: {best_angle:.2f}°, Shift: {best_shift:.2f} px")
-            
-            # Generate Final Result
-            h, w = image_gray.shape
-            axis_x = center_guess[0] + best_shift
-            
-            # 1. Rotate Original Color Image
-            M_rot = cv2.getRotationMatrix2D(center_guess, best_angle, 1.0)
-            final_rot = cv2.warpAffine(image, M_rot, (w, h), flags=cv2.INTER_LINEAR)
-            
-            # 2. Create Symmetrical Face (Left side mirrored to Right)
-            # We need to decide which side is "better" or just show the mirror.
-            # Usually "Symmetry" implies constructing a face from one half.
-            # But the prompt asks to "flip the face... to find how symmetrical the face is".
-            # So showing the difference map is good, and maybe the "Perfectly Symmetrical" version.
-            
-            # Let's create the "Symmetrized" version by averaging the flipped and original
-            M_flip = np.float32([[-1, 0, 2*axis_x], [0, 1, 0]])
-            final_flipped = cv2.warpAffine(final_rot, M_flip, (w, h), flags=cv2.INTER_LINEAR)
-            
-            # Create a composite: Left half of Rotated + Right half of Flipped (which is Left side mirrored)
-            # Actually, let's just show the "Symmetrical Composite" (Average)
-            symmetrical_avg = cv2.addWeighted(final_rot, 0.5, final_flipped, 0.5, 0)
-            
-            # Difference Map (Heatmap)
-            diff = cv2.absdiff(final_rot, final_flipped)
-            diff = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
-            diff_heatmap = cv2.applyColorMap(diff, cv2.COLORMAP_JET)
-            
-            # Mask the heatmap
-            mask_rot = cv2.warpAffine(mask, M_rot, (w, h), flags=cv2.INTER_NEAREST)
-            mask_flipped = cv2.warpAffine(mask_rot, M_flip, (w, h), flags=cv2.INTER_NEAREST)
-            intersection = cv2.bitwise_and(mask_rot, mask_flipped)
-            diff_heatmap = cv2.bitwise_and(diff_heatmap, diff_heatmap, mask=intersection)
+        # Reset if new file uploaded
+        if st.session_state.last_uploaded_file != uploaded_file.name:
+            st.session_state.analysis_results = None
+            st.session_state.last_uploaded_file = uploaded_file.name
 
-            st.markdown("---")
-            st.markdown("### Results")
-            
-            r_col1, r_col2, r_col3 = st.columns(3)
-            
-            with r_col1:
-                st.image(final_rot, caption="Aligned Original", use_container_width=True)
+        if st.button("Analyze Symmetry"):
+            with st.spinner("Analyzing..."):
+                # We run the analysis. 
+                # Note: We are calling the cached function.
+                # If we want to show the "Optimization Progress" live, we can't use the cached function 
+                # exactly as is because the visualization callback won't run on cached hits.
+                # But for the "Restart" issue, caching is the solution.
+                # We will prioritize the stability of the app over the live optimization view for subsequent runs.
                 
-            with r_col2:
-                st.image(symmetrical_avg, caption="Symmetrized Face (Average)", use_container_width=True)
+                # To show live progress on the FIRST run, we can manually run the logic here, 
+                # OR we can just accept that the "Optimization Progress" view is a nice-to-have that 
+                # might not show on cached re-runs.
                 
-            with r_col3:
-                st.image(diff_heatmap, caption="Asymmetry Heatmap (Blue=Low, Red=High)", use_container_width=True)
+                # Let's run it directly here to populate session state.
+                results = run_analysis(image)
+                st.session_state.analysis_results = results
+                
+        if st.session_state.analysis_results:
+            results = st.session_state.analysis_results
+            
+            if results is None:
+                st.error("No face detected! Please try another image.")
+            else:
+                st.success(f"Optimization Complete! Best Angle: {results['best_angle']:.2f}°, Shift: {results['best_shift']:.2f} px")
+                
+                col1, col2 = st.columns(2)
+                with col1:
+                    # Draw landmarks
+                    img_debug = image.copy()
+                    landmarks_debug = results['landmarks_debug']
+                    if landmarks_debug:
+                        cv2.circle(img_debug, landmarks_debug['left_iris'], 5, (0, 255, 0), -1)
+                        cv2.circle(img_debug, landmarks_debug['right_iris'], 5, (0, 255, 0), -1)
+                        cv2.circle(img_debug, landmarks_debug['nose_tip'], 5, (255, 0, 0), -1)
+                        cv2.line(img_debug, landmarks_debug['left_iris'], landmarks_debug['right_iris'], (0, 255, 0), 2)
+                    st.image(img_debug, caption="Detected Landmarks", width="stretch")
+                
+                with col2:
+                    st.image(results['mask'], caption="Face Segmentation Mask", width="stretch")
+
+                st.markdown("---")
+                st.markdown("### Results")
+                
+                r_col1, r_col2, r_col3 = st.columns(3)
+                
+                with r_col1:
+                    st.image(results['final_rot'], caption="Aligned Original", width="stretch")
+                    
+                with r_col2:
+                    st.image(results['symmetrical_avg'], caption="Symmetrized Face (Average)", width="stretch")
+                    
+                with r_col3:
+                    st.image(results['diff_heatmap'], caption="Asymmetry Heatmap", width="stretch")
+
+                st.markdown("### Flipped Comparison")
+                st.markdown("Here is the original face next to the fully flipped version.")
+                f_col1, f_col2 = st.columns(2)
+                with f_col1:
+                    st.image(results['final_rot'], caption="Original", width="stretch")
+                with f_col2:
+                    st.image(results['final_flipped'], caption="Flipped", width="stretch")
+
+                st.markdown("### Rapid Flip Animation")
+                st.markdown("Click the button below to rapidly toggle between the original and flipped image.")
+                if st.button("Start Animation (5s)"):
+                    anim_placeholder = st.empty()
+                    for _ in range(25): 
+                        anim_placeholder.image(results['final_rot'], caption="Original", width="stretch")
+                        time.sleep(0.1)
+                        anim_placeholder.image(results['final_flipped'], caption="Flipped", width="stretch")
+                        time.sleep(0.1)
+                    anim_placeholder.image(results['final_rot'], caption="Original", width="stretch")
 
 if __name__ == "__main__":
     main()
