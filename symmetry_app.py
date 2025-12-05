@@ -51,7 +51,46 @@ def get_face_mask(image_rgb):
     center_x = np.mean([p[0] for p in points])
     center_y = np.mean([p[1] for p in points])
     
-    return mask, (center_x, center_y)
+    # Calculate initial rotation and shift guess based on eyes and nose
+    # Left Iris: 468, Right Iris: 473
+    # We used refine_landmarks=True so irises should be there.
+    landmarks_debug = {}
+    try:
+        left_iris = landmarks[468]
+        right_iris = landmarks[473]
+        nose_tip = landmarks[1]
+        
+        landmarks_debug['left_iris'] = (int(left_iris.x * w), int(left_iris.y * h))
+        landmarks_debug['right_iris'] = (int(right_iris.x * w), int(right_iris.y * h))
+        landmarks_debug['nose_tip'] = (int(nose_tip.x * w), int(nose_tip.y * h))
+
+        # 1. Initial Angle
+        # Calculate angle of the line connecting the eyes
+        dy = (right_iris.y - left_iris.y) * h
+        dx = (right_iris.x - left_iris.x) * w
+        angle = np.degrees(np.arctan2(dy, dx))
+        initial_angle = angle 
+        
+        # 2. Initial Shift
+        # We want the symmetry axis to pass through the midpoint between eyes.
+        # This is usually more robust than the nose for "symmetry".
+        eye_midpoint_x = (left_iris.x + right_iris.x) / 2 * w
+        eye_midpoint_y = (left_iris.y + right_iris.y) / 2 * h
+        
+        # We need the x-coordinate of this midpoint AFTER rotation by initial_angle around (center_x, center_y).
+        M = cv2.getRotationMatrix2D((center_x, center_y), initial_angle, 1.0)
+        midpoint_pt = np.array([eye_midpoint_x, eye_midpoint_y, 1.0])
+        rotated_midpoint = M @ midpoint_pt
+        rotated_midpoint_x = rotated_midpoint[0]
+        
+        initial_shift = rotated_midpoint_x - center_x
+        
+    except IndexError:
+        # Fallback if iris landmarks are missing
+        initial_angle = 0
+        initial_shift = 0
+    
+    return mask, (center_x, center_y), (initial_angle, initial_shift), landmarks_debug
 
 def rotate_image(image, angle, center=None):
     h, w = image.shape[:2]
@@ -155,11 +194,11 @@ def main():
             scale = max_dim / max(h, w)
             image = cv2.resize(image, (int(w*scale), int(h*scale)))
             
-        st.image(image, caption="Original Image", use_column_width=True)
+        st.image(image, caption="Original Image", use_container_width=True)
         
         if st.button("Analyze Symmetry"):
             with st.spinner("Detecting face and segmenting..."):
-                mask, center_guess = get_face_mask(image)
+                mask, center_guess, initial_guess_params, landmarks_debug = get_face_mask(image)
                 
             if mask is None:
                 st.error("No face detected! Please try another image.")
@@ -169,7 +208,16 @@ def main():
             
             col1, col2 = st.columns(2)
             with col1:
-                st.image(mask, caption="Face Segmentation Mask", use_column_width=True)
+                # Draw landmarks on a copy of the image for visualization
+                img_debug = image.copy()
+                if landmarks_debug:
+                    cv2.circle(img_debug, landmarks_debug['left_iris'], 5, (0, 255, 0), -1)
+                    cv2.circle(img_debug, landmarks_debug['right_iris'], 5, (0, 255, 0), -1)
+                    cv2.circle(img_debug, landmarks_debug['nose_tip'], 5, (255, 0, 0), -1)
+                    # Draw line between eyes
+                    cv2.line(img_debug, landmarks_debug['left_iris'], landmarks_debug['right_iris'], (0, 255, 0), 2)
+                
+                st.image(img_debug, caption="Detected Landmarks (Eyes & Nose)", use_container_width=True)
             
             # Prepare for optimization
             image_gray = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
@@ -183,11 +231,17 @@ def main():
             def loss_func(params):
                 return transform_and_compare(params, image_gray, mask, center_guess, viz_placeholder)
             
-            # Initial guess: 0 degrees rotation, 0 shift from centroid
-            initial_guess = [0, 0] 
+            # Initial guess: Use calculated params from landmarks
+            initial_guess = initial_guess_params
+            st.info(f"Initial Guess from Landmarks - Angle: {initial_guess[0]:.2f}°, Shift: {initial_guess[1]:.2f} px")
             
-            # Bounds: Angle +/- 45 degrees, Shift +/- 100 pixels
-            bounds = [(-45, 45), (-w/4, w/4)]
+            # Bounds: Angle +/- 10 degrees, Shift +/- 20 pixels
+            # We trust the landmarks significantly more now.
+            # The optimization should only refine slightly.
+            bounds = [
+                (initial_guess[0] - 10, initial_guess[0] + 10), 
+                (initial_guess[1] - 20, initial_guess[1] + 20)
+            ]
             
             # Run optimization
             # Powell is a good method for this kind of parameter search without gradients
@@ -237,13 +291,13 @@ def main():
             r_col1, r_col2, r_col3 = st.columns(3)
             
             with r_col1:
-                st.image(final_rot, caption="Aligned Original", use_column_width=True)
+                st.image(final_rot, caption="Aligned Original", use_container_width=True)
                 
             with r_col2:
-                st.image(symmetrical_avg, caption="Symmetrized Face (Average)", use_column_width=True)
+                st.image(symmetrical_avg, caption="Symmetrized Face (Average)", use_container_width=True)
                 
             with r_col3:
-                st.image(diff_heatmap, caption="Asymmetry Heatmap (Blue=Low, Red=High)", use_column_width=True)
+                st.image(diff_heatmap, caption="Asymmetry Heatmap (Blue=Low, Red=High)", use_container_width=True)
 
 if __name__ == "__main__":
     main()
