@@ -499,20 +499,6 @@ def run_analysis(image):
     heatmap_overlay = np.where(intersection[:, :, np.newaxis] > 0, heatmap_overlay, final_rot_bgr)
     heatmap_overlay = cv2.cvtColor(heatmap_overlay, cv2.COLOR_BGR2RGB)
     
-    # Create "hot spots" version - only show the worst asymmetries
-    threshold = np.percentile(masked_values, 75) if len(masked_values) > 0 else 128
-    hot_spots_mask = (diff_masked > threshold).astype(np.uint8) * 255
-    # Dilate to make spots more visible
-    hot_spots_mask = cv2.dilate(hot_spots_mask, np.ones((5, 5), np.uint8), iterations=1)
-    
-    # Create hot spots visualization: original face with red overlay on problem areas
-    hot_spots_vis = final_rot.copy()
-    red_overlay = np.zeros_like(final_rot)
-    red_overlay[:, :] = [255, 0, 0]  # Red color
-    hot_spots_vis = np.where(hot_spots_mask[:, :, np.newaxis] > 0, 
-                              cv2.addWeighted(final_rot, 0.4, red_overlay, 0.6, 0),
-                              final_rot)
-    
     return {
         "mask": mask,
         "landmarks_debug": landmarks_debug,
@@ -522,7 +508,8 @@ def run_analysis(image):
         "symmetrical_avg": symmetrical_avg,
         "diff_heatmap": diff_heatmap,
         "heatmap_overlay": heatmap_overlay,
-        "hot_spots_vis": hot_spots_vis,
+        "diff_masked": diff_masked,
+        "intersection": intersection,
         "best_angle": best_angle,
         "best_shift": best_shift,
         "initial_guess": initial_guess
@@ -634,7 +621,36 @@ def main():
                     st.image(results['heatmap_overlay'], caption="Heatmap Overlay (asymmetries on face)", width="stretch")
                     
                 with h_col2:
-                    st.image(results['hot_spots_vis'], caption="🚨 Problem Areas (top 25% differences)", width="stretch")
+                    # Generate hot spots visualization with adjustable threshold
+                    threshold_pct = st.slider(
+                        "Threshold (% of differences to highlight)",
+                        min_value=0,
+                        max_value=100,
+                        value=25,
+                        help="Lower values highlight more areas, higher values show only the most prominent asymmetries"
+                    )
+                    
+                    # Calculate threshold from percentile (inverting: 25% means top 25%, so 75th percentile)
+                    diff_masked = results['diff_masked']
+                    intersection = results['intersection']
+                    masked_values = diff_masked[intersection > 0]
+                    
+                    percentile = 100 - threshold_pct  # Convert to percentile (25% -> 75th percentile)
+                    threshold_val = np.percentile(masked_values, percentile) if len(masked_values) > 0 else 128
+                    hot_spots_mask = (diff_masked > threshold_val).astype(np.uint8) * 255
+                    # Dilate to make spots more visible
+                    hot_spots_mask = cv2.dilate(hot_spots_mask, np.ones((5, 5), np.uint8), iterations=1)
+                    
+                    # Create hot spots visualization: original face with red overlay on problem areas
+                    final_rot = results['final_rot']
+                    hot_spots_vis = final_rot.copy()
+                    red_overlay = np.zeros_like(final_rot)
+                    red_overlay[:, :] = [255, 0, 0]  # Red color
+                    hot_spots_vis = np.where(hot_spots_mask[:, :, np.newaxis] > 0, 
+                                              cv2.addWeighted(final_rot, 0.4, red_overlay, 0.6, 0),
+                                              final_rot)
+                    
+                    st.image(hot_spots_vis, caption=f"🚨 Problem Areas (top {threshold_pct}% differences)", width="stretch")
                     
                 with h_col3:
                     st.image(results['diff_heatmap'], caption="Pure Asymmetry Heatmap", width="stretch")
