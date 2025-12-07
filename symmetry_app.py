@@ -213,16 +213,59 @@ def run_analysis(image):
     # Average Symmetry
     symmetrical_avg = cv2.addWeighted(final_rot, 0.5, final_flipped, 0.5, 0)
     
-    # Difference Map (Heatmap)
+    # Difference Map (Enhanced Heatmap for highlighting asymmetries)
     diff = cv2.absdiff(final_rot, final_flipped)
-    diff = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
-    diff_heatmap = cv2.applyColorMap(diff, cv2.COLORMAP_JET)
+    diff_gray = cv2.cvtColor(diff, cv2.COLOR_RGB2GRAY)
     
-    # Mask the heatmap
+    # Mask the difference
     mask_rot = cv2.warpAffine(mask, M_rot, (w, h), flags=cv2.INTER_NEAREST)
     mask_flipped = cv2.warpAffine(mask_rot, M_flip, (w, h), flags=cv2.INTER_NEAREST)
     intersection = cv2.bitwise_and(mask_rot, mask_flipped)
+    
+    # Apply mask before processing
+    diff_masked = cv2.bitwise_and(diff_gray, diff_gray, mask=intersection)
+    
+    # Enhance contrast: normalize to full range within the masked area
+    masked_values = diff_masked[intersection > 0]
+    if len(masked_values) > 0:
+        min_val = np.percentile(masked_values, 2)  # Use percentiles to avoid outliers
+        max_val = np.percentile(masked_values, 98)
+        if max_val > min_val:
+            diff_normalized = np.clip((diff_masked.astype(float) - min_val) / (max_val - min_val), 0, 1)
+        else:
+            diff_normalized = diff_masked.astype(float) / 255.0
+    else:
+        diff_normalized = diff_masked.astype(float) / 255.0
+    
+    # Apply gamma correction to boost visibility of subtle differences
+    gamma = 0.5  # Values < 1 boost darker regions (subtle asymmetries)
+    diff_boosted = np.power(diff_normalized, gamma)
+    diff_boosted = (diff_boosted * 255).astype(np.uint8)
+    
+    # Apply colormap - use INFERNO for better perceptual contrast (black -> purple -> red -> yellow)
+    diff_heatmap = cv2.applyColorMap(diff_boosted, cv2.COLORMAP_INFERNO)
     diff_heatmap = cv2.bitwise_and(diff_heatmap, diff_heatmap, mask=intersection)
+    
+    # Create overlay version: heatmap blended with face for context
+    final_rot_bgr = cv2.cvtColor(final_rot, cv2.COLOR_RGB2BGR)
+    heatmap_overlay = cv2.addWeighted(final_rot_bgr, 0.4, diff_heatmap, 0.6, 0)
+    # Restore areas outside mask to show original face
+    heatmap_overlay = np.where(intersection[:, :, np.newaxis] > 0, heatmap_overlay, final_rot_bgr)
+    heatmap_overlay = cv2.cvtColor(heatmap_overlay, cv2.COLOR_BGR2RGB)
+    
+    # Create "hot spots" version - only show the worst asymmetries
+    threshold = np.percentile(masked_values, 75) if len(masked_values) > 0 else 128
+    hot_spots_mask = (diff_masked > threshold).astype(np.uint8) * 255
+    # Dilate to make spots more visible
+    hot_spots_mask = cv2.dilate(hot_spots_mask, np.ones((5, 5), np.uint8), iterations=1)
+    
+    # Create hot spots visualization: original face with red overlay on problem areas
+    hot_spots_vis = final_rot.copy()
+    red_overlay = np.zeros_like(final_rot)
+    red_overlay[:, :] = [255, 0, 0]  # Red color
+    hot_spots_vis = np.where(hot_spots_mask[:, :, np.newaxis] > 0, 
+                              cv2.addWeighted(final_rot, 0.4, red_overlay, 0.6, 0),
+                              final_rot)
     
     return {
         "mask": mask,
@@ -232,6 +275,8 @@ def run_analysis(image):
         "final_flipped": final_flipped,
         "symmetrical_avg": symmetrical_avg,
         "diff_heatmap": diff_heatmap,
+        "heatmap_overlay": heatmap_overlay,
+        "hot_spots_vis": hot_spots_vis,
         "best_angle": best_angle,
         "best_shift": best_shift,
         "initial_guess": initial_guess
@@ -322,16 +367,31 @@ def main():
                 st.markdown("---")
                 st.markdown("### Results")
                 
-                r_col1, r_col2, r_col3 = st.columns(3)
+                r_col1, r_col2 = st.columns(2)
                 
                 with r_col1:
                     st.image(results['final_rot_with_line'], caption="Aligned Original with Symmetry Axis", width="stretch")
                     
                 with r_col2:
                     st.image(results['symmetrical_avg'], caption="Symmetrized Face (Average)", width="stretch")
+
+                st.markdown("---")
+                st.markdown("### 🔴 Asymmetry Analysis")
+                st.markdown("""
+                These visualizations highlight areas where your face differs from its mirror image. 
+                **Brighter/warmer colors = greater asymmetry.**
+                """)
+                
+                h_col1, h_col2, h_col3 = st.columns(3)
+                
+                with h_col1:
+                    st.image(results['heatmap_overlay'], caption="Heatmap Overlay (asymmetries on face)", width="stretch")
                     
-                with r_col3:
-                    st.image(results['diff_heatmap'], caption="Asymmetry Heatmap", width="stretch")
+                with h_col2:
+                    st.image(results['hot_spots_vis'], caption="🚨 Problem Areas (top 25% differences)", width="stretch")
+                    
+                with h_col3:
+                    st.image(results['diff_heatmap'], caption="Pure Asymmetry Heatmap", width="stretch")
 
                 st.markdown("### Flipped Comparison")
                 st.markdown("Here is the original face next to the fully flipped version.")
