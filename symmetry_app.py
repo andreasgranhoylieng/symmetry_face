@@ -5,6 +5,7 @@ import mediapipe as mp
 from scipy.optimize import minimize
 from PIL import Image
 import time
+from symmetry_scores import FacialSymmetryAnalyzer, FacialSymmetryReport
 
 # Initialize MediaPipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
@@ -20,8 +21,13 @@ def get_face_mask(image_rgb):
     Uses MediaPipe to detect face landmarks and create a binary mask 
     excluding hair, neck, and background.
     
-    Also estimates the symmetry axis using multiple facial landmarks
-    with weighted fitting and outlier rejection for robustness.
+    ADVANCED SYMMETRY AXIS ESTIMATION:
+    Uses a multi-stage approach for finding the perfect symmetry line:
+    1. PCA-based initial angle from symmetric pair midpoints
+    2. RANSAC for robust midline fitting with outlier rejection
+    3. 3D depth compensation using landmark z-coordinates
+    4. Weighted ensemble from multiple estimation methods
+    5. Cross-validation between methods for confidence scoring
     """
     results = face_mesh.process(image_rgb)
     
@@ -52,199 +58,335 @@ def get_face_mask(image_rgb):
     
     landmarks_debug = {}
     
-    # Symmetry axis estimation using multiple anatomical landmarks
-    # that should lie on the facial midline
+    # ============================================================
+    # ADVANCED SYMMETRY AXIS ESTIMATION
+    # ============================================================
     
-    # MediaPipe landmark indices for midline points (top to bottom):
-    # These landmarks should ideally lie on the vertical symmetry axis
+    # Extended midline landmarks for better coverage
     MIDLINE_LANDMARKS = {
         'forehead_top': 10,      # Top of forehead
+        'forehead_mid': 151,     # Mid forehead
         'glabella': 9,           # Between eyebrows (glabella)
         'nose_bridge_top': 168,  # Top of nose bridge
+        'nose_bridge_upper': 197, # Upper nose bridge
         'nose_bridge_mid': 6,    # Middle of nose bridge
         'nose_tip': 1,           # Tip of nose
-        'philtrum': 164,         # Philtrum (above upper lip)
+        'nose_bottom': 2,        # Bottom of nose
+        'philtrum_top': 164,     # Philtrum top
+        'philtrum_bottom': 167,  # Philtrum bottom
         'upper_lip': 0,          # Center of upper lip
         'lower_lip': 17,         # Center of lower lip
-        'chin': 152,             # Chin point
+        'chin_upper': 18,        # Upper chin
+        'chin_tip': 152,         # Chin tip
+        'chin_bottom': 175,      # Lower chin
     }
     
-    # Symmetric landmark pairs (left, right) for angle estimation
+    # Extended symmetric pairs with anatomical importance weights
     SYMMETRIC_PAIRS = [
-        (468, 473),   # Irises (if available with refine_landmarks=True)
-        (33, 263),    # Inner eye corners
-        (133, 362),   # Outer eye corners
-        (70, 300),    # Upper eyelid centers
-        (105, 334),   # Lower eyelid centers
-        (61, 291),    # Mouth corners
-        (78, 308),    # Upper lip sides
-        (95, 324),    # Lower lip sides
-        (50, 280),    # Upper cheeks
-        (101, 330),   # Lower cheeks
-        (234, 454),   # Temple/jaw line
+        # Most reliable - Eyes
+        (468, 473, 5.0, 'iris'),           # Irises (highest reliability)
+        (33, 263, 4.0, 'inner_eye'),       # Inner eye corners
+        (133, 362, 3.5, 'outer_eye'),      # Outer eye corners
+        (159, 386, 3.0, 'upper_lid'),      # Upper eyelid
+        (145, 374, 3.0, 'lower_lid'),      # Lower eyelid
+        
+        # Very reliable - Eyebrows
+        (107, 336, 2.5, 'inner_brow'),     # Inner eyebrow
+        (105, 334, 2.5, 'brow_peak'),      # Eyebrow peak
+        (70, 300, 2.0, 'outer_brow'),      # Outer eyebrow
+        
+        # Reliable - Nose
+        (129, 358, 2.5, 'nostril_outer'),  # Outer nostril
+        (98, 327, 2.0, 'nostril_bottom'),  # Bottom nostril
+        (49, 279, 2.0, 'alar'),            # Alar crease
+        
+        # Reliable - Mouth
+        (61, 291, 3.0, 'mouth_corner'),    # Mouth corners
+        (37, 267, 2.0, 'cupid_bow'),       # Cupid's bow peaks
+        (78, 308, 1.5, 'upper_lip'),       # Upper lip sides
+        (95, 324, 1.5, 'lower_lip'),       # Lower lip sides
+        
+        # Moderate reliability - Cheeks/Jaw
+        (116, 345, 1.5, 'cheekbone'),      # Cheekbone
+        (123, 352, 1.5, 'cheek'),          # Cheek
+        (172, 397, 2.0, 'jaw_angle'),      # Jaw angle
+        (136, 365, 1.5, 'jaw_mid'),        # Mid jaw
+        (234, 454, 1.0, 'temple'),         # Temple
+        (127, 356, 1.5, 'face_side'),      # Face side
     ]
     
     try:
-        # Collect midline points
-        midline_points = []
+        # ============================================================
+        # STAGE 1: Collect all landmark data with 3D coordinates
+        # ============================================================
+        
+        midline_points_3d = []
         for name, idx in MIDLINE_LANDMARKS.items():
             if idx < len(landmarks):
                 lm = landmarks[idx]
-                midline_points.append({
+                midline_points_3d.append({
                     'name': name,
                     'x': lm.x * w,
                     'y': lm.y * h,
-                    'weight': 1.0
+                    'z': lm.z * w,  # Z is relative depth, scale by width
+                    'visibility': getattr(lm, 'visibility', 1.0) if hasattr(lm, 'visibility') else 1.0
                 })
         
-        # Assign higher weights to more reliable midline landmarks
-        weight_map = {
-            'nose_bridge_top': 2.0,
-            'nose_bridge_mid': 2.0,
-            'nose_tip': 1.5,
-            'philtrum': 1.5,
-            'chin': 1.0,
-            'forehead_top': 0.8,  # Less reliable
-            'glabella': 1.2,
-            'upper_lip': 1.3,
-            'lower_lip': 1.0,
-        }
-        for pt in midline_points:
-            pt['weight'] = weight_map.get(pt['name'], 1.0)
-        
-        # Calculate rotation from symmetric pairs
-        angles = []
-        angle_weights = []
-        
-        for left_idx, right_idx in SYMMETRIC_PAIRS:
+        # Collect symmetric pair data
+        pair_data = []
+        for pair in SYMMETRIC_PAIRS:
+            left_idx, right_idx = pair[0], pair[1]
+            weight = pair[2] if len(pair) > 2 else 1.0
+            name = pair[3] if len(pair) > 3 else 'unknown'
+            
             if left_idx < len(landmarks) and right_idx < len(landmarks):
                 left_lm = landmarks[left_idx]
                 right_lm = landmarks[right_idx]
                 
-                lx, ly = left_lm.x * w, left_lm.y * h
-                rx, ry = right_lm.x * w, right_lm.y * h
-                
-                # The line connecting symmetric points should be horizontal
-                # after correction, so the angle of this line IS the needed rotation
-                dx = rx - lx
-                dy = ry - ly
-                
-                if abs(dx) > 5:  # Avoid division issues for nearly coincident points
-                    pair_angle = np.degrees(np.arctan2(dy, dx))
-                    
-                    # Weight by distance (longer pairs are more reliable)
-                    dist = np.sqrt(dx*dx + dy*dy)
-                    
-                    # Weight irises heavily, they're very reliable
-                    pair_weight = dist
-                    if (left_idx, right_idx) == (468, 473):
-                        pair_weight *= 3.0  # Irises get 3x weight
-                    elif (left_idx, right_idx) in [(33, 263), (133, 362)]:
-                        pair_weight *= 2.0  # Eye corners get 2x weight
-                    
-                    angles.append(pair_angle)
-                    angle_weights.append(pair_weight)
+                pair_data.append({
+                    'name': name,
+                    'left': (left_lm.x * w, left_lm.y * h, left_lm.z * w),
+                    'right': (right_lm.x * w, right_lm.y * h, right_lm.z * w),
+                    'weight': weight,
+                    'midpoint': ((left_lm.x + right_lm.x) / 2 * w, 
+                                (left_lm.y + right_lm.y) / 2 * h),
+                })
         
-        # Robust angle estimation: weighted median-ish approach
-        if len(angles) > 0:
-            angles = np.array(angles)
-            angle_weights = np.array(angle_weights)
+        # ============================================================
+        # STAGE 2: PCA-based angle estimation from midpoints
+        # ============================================================
+        
+        # Collect all points that should lie on the symmetry axis
+        axis_candidate_points = []
+        axis_weights = []
+        
+        # Add midline points
+        for pt in midline_points_3d:
+            axis_candidate_points.append([pt['x'], pt['y']])
+            # Weight by position (nose area most reliable)
+            name_weights = {
+                'nose_bridge_top': 3.0, 'nose_bridge_upper': 2.5,
+                'nose_bridge_mid': 3.0, 'nose_tip': 2.5,
+                'philtrum_top': 2.0, 'philtrum_bottom': 2.0,
+                'glabella': 1.5, 'forehead_top': 0.8, 'forehead_mid': 0.8,
+                'upper_lip': 1.5, 'lower_lip': 1.2,
+                'chin_upper': 1.0, 'chin_tip': 1.0, 'chin_bottom': 0.8,
+            }
+            axis_weights.append(name_weights.get(pt['name'], 1.0))
+        
+        # Add symmetric pair midpoints
+        for pair in pair_data:
+            axis_candidate_points.append(list(pair['midpoint']))
+            axis_weights.append(pair['weight'])
+        
+        axis_candidate_points = np.array(axis_candidate_points)
+        axis_weights = np.array(axis_weights)
+        
+        # Weighted PCA for initial angle estimation
+        weighted_center = np.average(axis_candidate_points, axis=0, weights=axis_weights)
+        centered_points = axis_candidate_points - weighted_center
+        
+        # Weighted covariance matrix
+        weighted_cov = np.zeros((2, 2))
+        total_weight = np.sum(axis_weights)
+        for i, (pt, wt) in enumerate(zip(centered_points, axis_weights)):
+            weighted_cov += wt * np.outer(pt, pt)
+        weighted_cov /= total_weight
+        
+        eigenvalues, eigenvectors = np.linalg.eigh(weighted_cov)
+        # Principal component is the SECOND eigenvector (we want axis direction)
+        # For a vertical line, we want the eigenvector with smaller variance
+        principal_axis = eigenvectors[:, 0]  # Smaller eigenvalue = tighter fit
+        
+        # Calculate angle from principal axis
+        pca_angle = np.degrees(np.arctan2(principal_axis[0], principal_axis[1]))
+        # Adjust to be close to 0 (vertical line should have ~0 angle)
+        if abs(pca_angle) > 45:
+            pca_angle = pca_angle - 90 if pca_angle > 0 else pca_angle + 90
+        
+        # ============================================================
+        # STAGE 3: Angle estimation from symmetric pairs with RANSAC
+        # ============================================================
+        
+        angles_from_pairs = []
+        angle_pair_weights = []
+        
+        for pair in pair_data:
+            lx, ly, lz = pair['left']
+            rx, ry, rz = pair['right']
             
-            # Use weighted average but with outlier rejection
-            # First pass: weighted mean
-            weighted_mean_angle = np.average(angles, weights=angle_weights)
+            dx = rx - lx
+            dy = ry - ly
+            dz = rz - lz
             
-            # Second pass: reject outliers (> 5 degrees from weighted mean)
-            inliers = np.abs(angles - weighted_mean_angle) < 5.0
-            if np.sum(inliers) >= 3:
-                initial_angle = np.average(angles[inliers], weights=angle_weights[inliers])
-            else:
-                initial_angle = weighted_mean_angle
+            if abs(dx) > 5:  # Avoid nearly coincident points
+                # 3D depth compensation: if one eye is closer, it appears larger
+                # Adjust for perspective distortion
+                depth_ratio = 1.0
+                avg_z = (lz + rz) / 2
+                if abs(dz) > 0.5 and abs(avg_z) > 0.1:
+                    # Points at different depths - compensate for perspective
+                    depth_ratio = 1.0 + 0.1 * (dz / w)  # Subtle adjustment
+                
+                pair_angle = np.degrees(np.arctan2(dy * depth_ratio, dx))
+                pair_distance = np.sqrt(dx*dx + dy*dy)
+                
+                angles_from_pairs.append(pair_angle)
+                angle_pair_weights.append(pair['weight'] * pair_distance)
+        
+        angles_from_pairs = np.array(angles_from_pairs)
+        angle_pair_weights = np.array(angle_pair_weights)
+        
+        # RANSAC-style robust angle estimation
+        if len(angles_from_pairs) >= 5:
+            best_inliers = 0
+            best_angle = np.average(angles_from_pairs, weights=angle_pair_weights)
+            
+            # Multiple RANSAC iterations
+            for _ in range(50):
+                # Randomly sample 3 pairs
+                sample_idx = np.random.choice(len(angles_from_pairs), size=min(3, len(angles_from_pairs)), replace=False)
+                sample_angles = angles_from_pairs[sample_idx]
+                sample_weights = angle_pair_weights[sample_idx]
+                
+                # Estimate angle from sample
+                candidate_angle = np.average(sample_angles, weights=sample_weights)
+                
+                # Count inliers (within 2 degrees)
+                residuals = np.abs(angles_from_pairs - candidate_angle)
+                inlier_mask = residuals < 2.0
+                num_inliers = np.sum(inlier_mask * angle_pair_weights)
+                
+                if num_inliers > best_inliers:
+                    best_inliers = num_inliers
+                    # Refit using all inliers
+                    if np.sum(inlier_mask) >= 3:
+                        best_angle = np.average(
+                            angles_from_pairs[inlier_mask], 
+                            weights=angle_pair_weights[inlier_mask]
+                        )
+            
+            ransac_angle = best_angle
         else:
-            initial_angle = 0.0
+            ransac_angle = np.average(angles_from_pairs, weights=angle_pair_weights) if len(angles_from_pairs) > 0 else 0.0
         
-        # Calculate shift from midline points
-        # After rotating by initial_angle, the midline points should align vertically
-        # Find the x-coordinate where they best align
+        # ============================================================
+        # STAGE 4: Combine angle estimates with confidence weighting
+        # ============================================================
         
+        # Check agreement between PCA and RANSAC
+        angle_agreement = abs(pca_angle - ransac_angle)
+        
+        if angle_agreement < 1.0:
+            # High agreement - use weighted average
+            initial_angle = 0.6 * ransac_angle + 0.4 * pca_angle
+        elif angle_agreement < 3.0:
+            # Moderate agreement - favor RANSAC (more robust to outliers)
+            initial_angle = 0.75 * ransac_angle + 0.25 * pca_angle
+        else:
+            # Disagreement - use RANSAC as it's more robust
+            initial_angle = ransac_angle
+        
+        # ============================================================
+        # STAGE 5: Precise axis position estimation with RANSAC
+        # ============================================================
+        
+        # Rotate all candidate points by the estimated angle
         M_rot = cv2.getRotationMatrix2D((center_x, center_y), initial_angle, 1.0)
         
-        rotated_midline_x = []
-        rotated_midline_weights = []
+        rotated_axis_x = []
+        rotated_axis_weights = []
         
-        for pt in midline_points:
+        # Rotate and collect midline points
+        for pt in midline_points_3d:
             original_pt = np.array([pt['x'], pt['y'], 1.0])
             rotated_pt = M_rot @ original_pt
-            rotated_midline_x.append(rotated_pt[0])
-            rotated_midline_weights.append(pt['weight'])
+            rotated_axis_x.append(rotated_pt[0])
+            
+            name_weights = {
+                'nose_bridge_top': 3.0, 'nose_bridge_upper': 2.5,
+                'nose_bridge_mid': 3.0, 'nose_tip': 2.5,
+                'philtrum_top': 2.0, 'philtrum_bottom': 2.0,
+                'glabella': 1.5, 'upper_lip': 1.5,
+            }
+            rotated_axis_weights.append(name_weights.get(pt['name'], 1.0))
         
-        if len(rotated_midline_x) > 0:
-            # Weighted median for robustness
-            rotated_midline_x = np.array(rotated_midline_x)
-            rotated_midline_weights = np.array(rotated_midline_weights)
+        # Rotate and collect pair midpoints
+        for pair in pair_data:
+            mid_x, mid_y = pair['midpoint']
+            original_pt = np.array([mid_x, mid_y, 1.0])
+            rotated_pt = M_rot @ original_pt
+            rotated_axis_x.append(rotated_pt[0])
+            rotated_axis_weights.append(pair['weight'])
+        
+        rotated_axis_x = np.array(rotated_axis_x)
+        rotated_axis_weights = np.array(rotated_axis_weights)
+        
+        # RANSAC for axis position
+        if len(rotated_axis_x) >= 5:
+            best_inliers = 0
+            best_axis_x = np.average(rotated_axis_x, weights=rotated_axis_weights)
             
-            # Use weighted mean with outlier rejection
-            weighted_mean_x = np.average(rotated_midline_x, weights=rotated_midline_weights)
+            for _ in range(50):
+                # Random sample
+                sample_idx = np.random.choice(len(rotated_axis_x), size=min(3, len(rotated_axis_x)), replace=False)
+                candidate_x = np.average(rotated_axis_x[sample_idx], weights=rotated_axis_weights[sample_idx])
+                
+                # Count inliers (within 3 pixels)
+                residuals = np.abs(rotated_axis_x - candidate_x)
+                inlier_mask = residuals < 3.0
+                num_inliers = np.sum(inlier_mask * rotated_axis_weights)
+                
+                if num_inliers > best_inliers:
+                    best_inliers = num_inliers
+                    if np.sum(inlier_mask) >= 3:
+                        best_axis_x = np.average(
+                            rotated_axis_x[inlier_mask], 
+                            weights=rotated_axis_weights[inlier_mask]
+                        )
             
-            # Reject outliers (points too far from weighted mean - likely measurement error)
-            deviations = np.abs(rotated_midline_x - weighted_mean_x)
-            threshold = np.percentile(deviations, 75) * 2.5 + 3  # Robust threshold
-            inliers = deviations < threshold
-            
-            if np.sum(inliers) >= 3:
-                axis_x_after_rotation = np.average(
-                    rotated_midline_x[inliers], 
-                    weights=rotated_midline_weights[inliers]
-                )
-            else:
-                axis_x_after_rotation = weighted_mean_x
-            
-            initial_shift = axis_x_after_rotation - center_x
+            final_axis_x = best_axis_x
         else:
-            initial_shift = 0.0
+            final_axis_x = np.average(rotated_axis_x, weights=rotated_axis_weights)
         
-        # Add symmetric pair midpoints for additional validation
-        # The midpoint of each symmetric pair should also lie on the symmetry axis
-        pair_midpoints_x = []
+        initial_shift = final_axis_x - center_x
         
-        for left_idx, right_idx in SYMMETRIC_PAIRS:
-            if left_idx < len(landmarks) and right_idx < len(landmarks):
-                left_lm = landmarks[left_idx]
-                right_lm = landmarks[right_idx]
+        # ============================================================
+        # STAGE 6: Fine-tune using geometric constraints
+        # ============================================================
+        
+        # Use iris centers as the most reliable reference if available
+        try:
+            left_iris = landmarks[468]
+            right_iris = landmarks[473]
+            
+            iris_mid_x = (left_iris.x + right_iris.x) / 2 * w
+            iris_mid_y = (left_iris.y + right_iris.y) / 2 * h
+            
+            # Rotate iris midpoint
+            iris_pt = np.array([iris_mid_x, iris_mid_y, 1.0])
+            rotated_iris = M_rot @ iris_pt
+            
+            # Iris midpoint should be VERY close to the axis
+            iris_axis_diff = rotated_iris[0] - final_axis_x
+            
+            # If iris suggests different position, blend slightly towards it
+            if abs(iris_axis_diff) < 10:  # Sanity check
+                initial_shift += iris_axis_diff * 0.3  # 30% correction towards iris
+            
+            # Similarly refine angle using iris pair
+            iris_dx = right_iris.x * w - left_iris.x * w
+            iris_dy = right_iris.y * h - left_iris.y * h
+            iris_angle = np.degrees(np.arctan2(iris_dy, iris_dx))
+            
+            angle_diff = iris_angle - initial_angle
+            if abs(angle_diff) < 3:  # Sanity check
+                initial_angle += angle_diff * 0.2  # 20% correction towards iris angle
                 
-                mid_x = (left_lm.x + right_lm.x) / 2 * w
-                mid_y = (left_lm.y + right_lm.y) / 2 * h
-                
-                original_pt = np.array([mid_x, mid_y, 1.0])
-                rotated_pt = M_rot @ original_pt
-                pair_midpoints_x.append(rotated_pt[0])
+        except (IndexError, AttributeError):
+            pass
         
-        if len(pair_midpoints_x) > 0:
-            # Combine midline points and pair midpoints for final estimate
-            pair_midpoints_x = np.array(pair_midpoints_x)
-            combined_x = np.concatenate([
-                rotated_midline_x,
-                pair_midpoints_x
-            ])
-            combined_weights = np.concatenate([
-                rotated_midline_weights * 1.5,  # Midline points get higher weight
-                np.ones(len(pair_midpoints_x))
-            ])
-            
-            # Final robust estimate
-            final_axis_x = np.average(combined_x, weights=combined_weights)
-            
-            # Outlier rejection
-            deviations = np.abs(combined_x - final_axis_x)
-            threshold = np.percentile(deviations, 80) * 2.0 + 3
-            inliers = deviations < threshold
-            
-            if np.sum(inliers) >= 5:
-                final_axis_x = np.average(combined_x[inliers], weights=combined_weights[inliers])
-            
-            initial_shift = final_axis_x - center_x
-        
-        # Store debug info
+        # Store enhanced debug info
         try:
             left_iris = landmarks[468]
             right_iris = landmarks[473]
@@ -256,9 +398,20 @@ def get_face_mask(image_rgb):
             
             # Add midline debug visualization
             landmarks_debug['midline_points'] = [
-                (int(pt['x']), int(pt['y'])) for pt in midline_points
+                (int(pt['x']), int(pt['y'])) for pt in midline_points_3d
             ]
-        except IndexError:
+            
+            # Add pair midpoints for debugging
+            landmarks_debug['pair_midpoints'] = [
+                (int(pair['midpoint'][0]), int(pair['midpoint'][1])) for pair in pair_data
+            ]
+            
+            # Store estimation confidence info
+            landmarks_debug['angle_agreement'] = angle_agreement
+            landmarks_debug['pca_angle'] = pca_angle
+            landmarks_debug['ransac_angle'] = ransac_angle
+            
+        except (IndexError, AttributeError):
             pass
         
     except Exception as e:
@@ -267,6 +420,7 @@ def get_face_mask(image_rgb):
         initial_shift = 0
     
     return mask, (center_x, center_y), (initial_angle, initial_shift), landmarks_debug
+
 
 def rotate_image(image, angle, center=None):
     h, w = image.shape[:2]
@@ -381,64 +535,144 @@ def run_analysis(image):
     
     initial_guess = initial_guess_params
     
-    # Coarse optimization: wider search at reduced resolution
-    scale_factor = 0.5
-    small_gray = cv2.resize(image_gray, None, fx=scale_factor, fy=scale_factor)
-    small_mask = cv2.resize(mask, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_NEAREST)
-    small_edges = cv2.resize(edge_weights, None, fx=scale_factor, fy=scale_factor)
-    small_center = (center_guess[0] * scale_factor, center_guess[1] * scale_factor)
+    # ============================================================
+    # ENHANCED 3-STAGE MULTI-RESOLUTION OPTIMIZATION
+    # For sub-pixel accuracy in symmetry line detection
+    # ============================================================
     
-    def coarse_loss(params):
-        # Scale shift parameter for smaller image
-        scaled_params = [params[0], params[1] * scale_factor]
+    # Stage 1: Very coarse search at 0.25x resolution (fast global search)
+    scale_1 = 0.25
+    tiny_gray = cv2.resize(image_gray, None, fx=scale_1, fy=scale_1)
+    tiny_mask = cv2.resize(mask, None, fx=scale_1, fy=scale_1, interpolation=cv2.INTER_NEAREST)
+    tiny_edges = cv2.resize(edge_weights, None, fx=scale_1, fy=scale_1)
+    tiny_center = (center_guess[0] * scale_1, center_guess[1] * scale_1)
+    
+    def loss_scale_1(params):
+        scaled_params = [params[0], params[1] * scale_1]
+        return transform_and_compare(
+            scaled_params, tiny_gray, tiny_mask, tiny_center, tiny_edges
+        )
+    
+    # Stage 2: Coarse search at 0.5x resolution
+    scale_2 = 0.5
+    small_gray = cv2.resize(image_gray, None, fx=scale_2, fy=scale_2)
+    small_mask = cv2.resize(mask, None, fx=scale_2, fy=scale_2, interpolation=cv2.INTER_NEAREST)
+    small_edges = cv2.resize(edge_weights, None, fx=scale_2, fy=scale_2)
+    small_center = (center_guess[0] * scale_2, center_guess[1] * scale_2)
+    
+    def loss_scale_2(params):
+        scaled_params = [params[0], params[1] * scale_2]
         return transform_and_compare(
             scaled_params, small_gray, small_mask, small_center, small_edges
         )
     
-    # Coarse search with wider bounds
-    coarse_bounds = [
-        (initial_guess[0] - 15, initial_guess[0] + 15),  # ±15° angle
-        (initial_guess[1] - 40, initial_guess[1] + 40)   # ±40px shift
-    ]
-    
-    # Global search using differential evolution
-    from scipy.optimize import differential_evolution, minimize
-    
-    try:
-        coarse_result = differential_evolution(
-            coarse_loss, 
-            coarse_bounds, 
-            maxiter=30,
-            tol=0.1,
-            seed=42,
-            workers=1,
-            polish=False
-        )
-        coarse_angle, coarse_shift = coarse_result.x
-    except:
-        # Fallback if differential_evolution fails
-        coarse_angle, coarse_shift = initial_guess
-    
-    # Fine optimization: local refinement at full resolution
-    def fine_loss(params):
+    # Stage 3: Fine search at full resolution
+    def loss_full(params):
         return transform_and_compare(
             params, image_gray, mask, center_guess, edge_weights
         )
     
-    # Fine bounds centered on coarse result
-    fine_bounds = [
-        (coarse_angle - 3, coarse_angle + 3),   # ±3° around coarse result
-        (coarse_shift - 10, coarse_shift + 10)  # ±10px around coarse result
+    from scipy.optimize import differential_evolution, minimize
+    
+    # ============================================================
+    # STAGE 1: Global search at 0.25x (wide exploration)
+    # ============================================================
+    stage1_bounds = [
+        (initial_guess[0] - 20, initial_guess[0] + 20),  # ±20° angle
+        (initial_guess[1] - 60, initial_guess[1] + 60)   # ±60px shift
     ]
     
-    fine_result = minimize(
-        fine_loss, 
-        [coarse_angle, coarse_shift], 
-        method='Nelder-Mead',
-        options={'xatol': 0.01, 'fatol': 0.1}
-    )
+    try:
+        # Use differential evolution for global search
+        result_1 = differential_evolution(
+            loss_scale_1, 
+            stage1_bounds, 
+            maxiter=50,      # More iterations for thorough search
+            popsize=20,      # Larger population for better coverage
+            tol=0.05,
+            seed=42,
+            workers=1,
+            polish=False,
+            mutation=(0.5, 1.0),
+            recombination=0.7
+        )
+        stage1_angle, stage1_shift = result_1.x
+    except Exception:
+        stage1_angle, stage1_shift = initial_guess
     
-    best_angle, best_shift = fine_result.x
+    # ============================================================
+    # STAGE 2: Refined search at 0.5x (narrower bounds)
+    # ============================================================
+    stage2_bounds = [
+        (stage1_angle - 8, stage1_angle + 8),   # ±8° around stage 1
+        (stage1_shift - 25, stage1_shift + 25)  # ±25px around stage 1
+    ]
+    
+    try:
+        result_2 = differential_evolution(
+            loss_scale_2, 
+            stage2_bounds, 
+            maxiter=40,
+            popsize=15,
+            tol=0.02,
+            seed=42,
+            workers=1,
+            polish=True,  # Enable polishing for better local minimum
+            mutation=(0.4, 0.9),
+            recombination=0.8
+        )
+        stage2_angle, stage2_shift = result_2.x
+    except Exception:
+        stage2_angle, stage2_shift = stage1_angle, stage1_shift
+    
+    # ============================================================
+    # STAGE 3: Fine optimization at full resolution
+    # ============================================================
+    
+    # 3a: Nelder-Mead for robust local search
+    fine_result = minimize(
+        loss_full, 
+        [stage2_angle, stage2_shift], 
+        method='Nelder-Mead',
+        options={
+            'xatol': 0.005,   # High angle precision (0.005 degrees)
+            'fatol': 0.05,    # Low function tolerance
+            'maxiter': 200,   # More iterations
+            'adaptive': True  # Adaptive algorithm for better convergence
+        }
+    )
+    stage3_angle, stage3_shift = fine_result.x
+    
+    # 3b: BFGS refinement for gradient-based polishing
+    try:
+        # Use BFGS for final sub-pixel refinement
+        bfgs_result = minimize(
+            loss_full, 
+            [stage3_angle, stage3_shift], 
+            method='L-BFGS-B',
+            bounds=[
+                (stage3_angle - 0.5, stage3_angle + 0.5),  # ±0.5° very tight
+                (stage3_shift - 3, stage3_shift + 3)       # ±3px very tight
+            ],
+            options={
+                'ftol': 1e-8,    # Very high precision
+                'gtol': 1e-7,
+                'maxiter': 100
+            }
+        )
+        best_angle, best_shift = bfgs_result.x
+    except Exception:
+        best_angle, best_shift = stage3_angle, stage3_shift
+    
+    # ============================================================
+    # FINAL VALIDATION: Ensure solution is better than initial
+    # ============================================================
+    initial_loss = loss_full(initial_guess)
+    final_loss = loss_full([best_angle, best_shift])
+    
+    # If optimization made things worse, fall back to initial guess
+    if final_loss > initial_loss * 1.1:  # Allow 10% tolerance
+        best_angle, best_shift = initial_guess
 
     
     # Generate Final Result
@@ -673,6 +907,151 @@ def main():
                         anim_placeholder.image(results['final_flipped'], caption="Flipped", width="stretch")
                         time.sleep(0.1)
                     anim_placeholder.image(results['final_rot'], caption="Original", width="stretch")
+
+                # Detailed Symmetry Scores Section
+                st.markdown("---")
+                st.markdown("### 📊 Detailed Symmetry Scores")
+                st.markdown("""
+                This analysis breaks down facial symmetry into specific anatomical categories.
+                Each score is from 0-100 where **100 = perfect symmetry**.
+                """)
+                
+                # Run the detailed symmetry analysis
+                analyzer = FacialSymmetryAnalyzer()
+                symmetry_report = analyzer.analyze(image)
+                
+                if symmetry_report:
+                    # Overall score display with grade
+                    grade_colors = {
+                        "A+": "#00C853", "A": "#00E676", "A-": "#69F0AE",
+                        "B+": "#76FF03", "B": "#C6FF00", "B-": "#EEFF41",
+                        "C+": "#FFEA00", "C": "#FFC400", "C-": "#FF9100",
+                        "D": "#FF6D00", "F": "#FF3D00"
+                    }
+                    grade_color = grade_colors.get(symmetry_report.grade, "#FFFFFF")
+                    
+                    overall_col1, overall_col2, overall_col3 = st.columns([1, 2, 1])
+                    with overall_col2:
+                        st.markdown(f"""
+                        <div style="text-align: center; padding: 20px; background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%); border-radius: 15px; border: 2px solid {grade_color};">
+                            <h2 style="margin: 0; color: #ffffff;">Overall Symmetry Score</h2>
+                            <h1 style="font-size: 4em; margin: 10px 0; color: {grade_color};">{symmetry_report.overall_score:.1f}</h1>
+                            <h2 style="margin: 0; padding: 10px 20px; background: {grade_color}; border-radius: 10px; display: inline-block; color: #000000;">Grade: {symmetry_report.grade}</h2>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    
+                    st.markdown("")
+                    
+                    # Category breakdown with progress bars
+                    st.markdown("#### Category Breakdown")
+                    
+                    # Sort categories by score (highest first)
+                    sorted_categories = sorted(
+                        symmetry_report.category_scores.items(),
+                        key=lambda x: x[1].score,
+                        reverse=True
+                    )
+                    
+                    for category, score_data in sorted_categories:
+                        # Determine color based on score
+                        if score_data.score >= 85:
+                            bar_color = "#00C853"  # Green
+                            emoji = "✅"
+                        elif score_data.score >= 70:
+                            bar_color = "#76FF03"  # Light green
+                            emoji = "👍"
+                        elif score_data.score >= 55:
+                            bar_color = "#FFEA00"  # Yellow
+                            emoji = "⚠️"
+                        else:
+                            bar_color = "#FF6D00"  # Orange
+                            emoji = "📍"
+                        
+                        col1, col2 = st.columns([3, 1])
+                        
+                        with col1:
+                            # Make the category an expander button for interactive visualization
+                            with st.expander(f"{emoji} {category} — Score: {score_data.score:.0f}/100", expanded=False):
+                                # Show the asymmetry details
+                                st.markdown(f"**Analysis:** {score_data.asymmetry_details}")
+                                st.markdown(f"*{score_data.description}*")
+                                
+                                # Show visualization if available
+                                if score_data.visualization is not None:
+                                    from symmetry_scores import draw_category_visualization
+                                    
+                                    # Draw the annotated image
+                                    viz_image = draw_category_visualization(
+                                        image, 
+                                        score_data, 
+                                        symmetry_report.midline_x
+                                    )
+                                    
+                                    st.image(viz_image, caption=f"{category} Visualization", use_container_width=True)
+                                    
+                                    # Show key insight
+                                    if score_data.visualization.key_insight:
+                                        if score_data.score >= 85:
+                                            st.success(f"💡 {score_data.visualization.key_insight}")
+                                        elif score_data.score >= 70:
+                                            st.info(f"� {score_data.visualization.key_insight}")
+                                        else:
+                                            st.warning(f"💡 {score_data.visualization.key_insight}")
+                                    
+                                    # Show legend
+                                    st.markdown("""
+                                    **Legend:**
+                                    - 🟠 Orange dots = Left side landmarks
+                                    - 🔵 Cyan dots = Right side landmarks  
+                                    - 🟢 Green circles = Ideal (symmetric) positions
+                                    - 🔴 Red arrows = Suggested corrections
+                                    - ⚪ White line = Symmetry axis (midline)
+                                    """)
+                                else:
+                                    st.info("Visualization data not available for this category.")
+                                
+                                # Show detailed measurements
+                                st.markdown("---")
+                                st.markdown("**Measurements:**")
+                                meas_col1, meas_col2 = st.columns(2)
+                                
+                                with meas_col1:
+                                    st.markdown("*Left Side:*")
+                                    for key, value in score_data.left_measurements.items():
+                                        formatted_key = key.replace("_", " ").title()
+                                        st.text(f"  {formatted_key}: {value:.1f}")
+                                
+                                with meas_col2:
+                                    st.markdown("*Right Side:*")
+                                    for key, value in score_data.right_measurements.items():
+                                        formatted_key = key.replace("_", " ").title()
+                                        st.text(f"  {formatted_key}: {value:.1f}")
+                        
+                        with col2:
+                            st.markdown(f"""
+                            <div style="text-align: center; padding: 10px; background: {bar_color}20; border-radius: 10px; border: 1px solid {bar_color};">
+                                <span style="font-size: 1.5em; font-weight: bold; color: {bar_color};">{score_data.score:.0f}</span>
+                                <span style="color: #888;">/100</span>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        
+                        st.markdown("")
+                    
+                    # Strengths and Areas for Improvement
+                    st.markdown("---")
+                    str_col, imp_col = st.columns(2)
+                    
+                    with str_col:
+                        st.markdown("#### 💪 Strengths")
+                        for strength in symmetry_report.strengths:
+                            st.markdown(f"- {strength}")
+                    
+                    with imp_col:
+                        st.markdown("#### 🎯 Areas of Note")
+                        for area in symmetry_report.areas_for_improvement:
+                            st.markdown(f"- {area}")
+                else:
+                    st.warning("Could not generate detailed symmetry scores. Face detection may have failed.")
 
 if __name__ == "__main__":
     main()
